@@ -1,18 +1,90 @@
 const std = @import("std");
 
+pub const DnsName = struct {
+    name: []u8,
+    end_pos: usize,
+};
+
+pub const DnsQuestion = struct {
+    qname: []u8,
+    qtype: u16,
+    qclass: u16,
+    question_end: usize,
+};
+
 /// Extracts the domain name from a DNS request packet
 /// The returned domain name is a slice of a static buffer with the domain
 /// name in human-readable format (e.g., "example.com")
 /// TODO: This is probably missing many edge cases. E.g. reject multiple questions
 pub fn extractDomainName(buffer: []u8, packet: []const u8) ![]u8 {
+    const name = try parseDnsName(buffer, packet, 12);
+    return name.name;
+}
+
+pub fn parseDnsQuestion(buffer: []u8, packet: []const u8) !DnsQuestion {
     // DNS header is 12 bytes, the query starts after that
     if (packet.len < 13) return error.PacketTooShort;
 
-    var pos: usize = 12; // Start after header
+    const qname = try parseDnsName(buffer, packet, 12);
+    const qtype_pos = qname.end_pos;
+    if (qtype_pos + 4 > packet.len) return error.PacketTooShort;
+
+    const qtype = std.mem.readInt(u16, packet[qtype_pos..][0..2], .big);
+    const qclass = std.mem.readInt(u16, packet[qtype_pos + 2 ..][0..2], .big);
+
+    return .{
+        .qname = qname.name,
+        .qtype = qtype,
+        .qclass = qclass,
+        .question_end = qtype_pos + 4,
+    };
+}
+
+pub fn qtypeName(qtype: u16) ?[]const u8 {
+    return switch (qtype) {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        33 => "SRV",
+        64 => "SVCB",
+        65 => "HTTPS",
+        255 => "ANY",
+        else => null,
+    };
+}
+
+pub fn qclassName(qclass: u16) ?[]const u8 {
+    return switch (qclass) {
+        1 => "IN",
+        3 => "CH",
+        4 => "HS",
+        255 => "ANY",
+        else => null,
+    };
+}
+
+pub fn qtypeDisplay(qtype: u16, buffer: []u8) []const u8 {
+    return qtypeName(qtype) orelse std.fmt.bufPrintIntToSlice(buffer, qtype, 10, .lower, .{});
+}
+
+pub fn qclassDisplay(qclass: u16, buffer: []u8) []const u8 {
+    return qclassName(qclass) orelse std.fmt.bufPrintIntToSlice(buffer, qclass, 10, .lower, .{});
+}
+
+fn parseDnsName(buffer: []u8, packet: []const u8, start_pos: usize) !DnsName {
+    if (start_pos >= packet.len) return error.PacketTooShort;
+
+    var pos: usize = start_pos;
     var buf_pos: usize = 0;
     var first_label = true;
     var jumps: u8 = 0;
     const max_jumps = 10; // Prevent compression pointer loops
+    var end_pos: ?usize = null;
 
     while (pos < packet.len) {
         // Check for compression pointer (top 2 bits are 1s)
@@ -21,10 +93,12 @@ pub fn extractDomainName(buffer: []u8, packet: []const u8) ![]u8 {
             if (pos + 1 >= packet.len) return error.PacketTooShort;
 
             // Pointer is formed from the lower 14 bits of the two bytes
-            const offset = @as(u16, packet[pos] & 0x3F) << 8 | packet[pos + 1];
+            const offset = std.mem.readInt(u16, packet[pos..][0..2], .big) & 0x3FFF;
 
             // Make sure the pointer isn't obviously invalid (too large for the packet)
             if (offset >= packet.len) return error.InvalidPointer;
+
+            if (end_pos == null) end_pos = pos + 2;
 
             // Don't do position-based validation as it doesn't work with sliced packets
             // Instead, we'll rely on the max_jumps check to prevent infinite loops
@@ -37,7 +111,10 @@ pub fn extractDomainName(buffer: []u8, packet: []const u8) ![]u8 {
         pos += 1;
 
         // Zero length means end of domain name
-        if (label_len == 0) break;
+        if (label_len == 0) {
+            if (end_pos == null) end_pos = pos;
+            break;
+        }
 
         // Validate label length (DNS spec: max 63 bytes)
         if (label_len > 63) return error.LabelTooLong;
@@ -62,7 +139,10 @@ pub fn extractDomainName(buffer: []u8, packet: []const u8) ![]u8 {
         if (buf_pos > 255) return error.DomainNameTooLong;
     }
 
-    return buffer[0..buf_pos];
+    return .{
+        .name = buffer[0..buf_pos],
+        .end_pos = end_pos orelse return error.PacketTooShort,
+    };
 }
 
 /// Parses a hosts file (for example, https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts)
@@ -138,6 +218,73 @@ test "extract domain name" {
     var domain_buffer: [256]u8 = undefined;
     const domain_name = try extractDomainName(&domain_buffer, &bytes);
     try std.testing.expectEqualStrings("duckduckgo.com", domain_name);
+}
+
+test "parse DNS question for A record" {
+    const hex_string = "cfc9010000010000000000000a6475636b6475636b676f03636f6d0000010001";
+    var bytes: [hex_string.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, hex_string);
+
+    var domain_buffer: [256]u8 = undefined;
+    const question = try parseDnsQuestion(&domain_buffer, &bytes);
+
+    try std.testing.expectEqualStrings("duckduckgo.com", question.qname);
+    try std.testing.expectEqual(@as(u16, 1), question.qtype);
+    try std.testing.expectEqual(@as(u16, 1), question.qclass);
+    try std.testing.expectEqual(@as(usize, 32), question.question_end);
+    try std.testing.expectEqualStrings("A", qtypeName(question.qtype).?);
+    try std.testing.expectEqualStrings("IN", qclassName(question.qclass).?);
+}
+
+test "parse DNS question for AAAA record" {
+    const hex_string = "000101000001000000000000076578616d706c6503636f6d00001c0001";
+    var bytes: [hex_string.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, hex_string);
+
+    var domain_buffer: [256]u8 = undefined;
+    const question = try parseDnsQuestion(&domain_buffer, &bytes);
+
+    try std.testing.expectEqualStrings("example.com", question.qname);
+    try std.testing.expectEqual(@as(u16, 28), question.qtype);
+    try std.testing.expectEqual(@as(u16, 1), question.qclass);
+    try std.testing.expectEqual(@as(usize, 29), question.question_end);
+    try std.testing.expectEqualStrings("AAAA", qtypeName(question.qtype).?);
+}
+
+test "unknown DNS question type falls back to numeric display" {
+    const hex_string = "000101000001000000000000076578616d706c6503636f6d00fffe0001";
+    var bytes: [hex_string.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, hex_string);
+
+    var domain_buffer: [256]u8 = undefined;
+    const question = try parseDnsQuestion(&domain_buffer, &bytes);
+
+    try std.testing.expectEqualStrings("example.com", question.qname);
+    try std.testing.expectEqual(@as(u16, 65534), question.qtype);
+    try std.testing.expect(qtypeName(question.qtype) == null);
+    try std.testing.expectEqualStrings("IN", qclassName(question.qclass).?);
+}
+
+test "DNS question display names fall back to numbers" {
+    var qtype_buffer: [5]u8 = undefined;
+    var qclass_buffer: [5]u8 = undefined;
+
+    try std.testing.expectEqualStrings("A", qtypeDisplay(1, &qtype_buffer));
+    try std.testing.expectEqualStrings("65534", qtypeDisplay(65534, &qtype_buffer));
+    try std.testing.expectEqualStrings("IN", qclassDisplay(1, &qclass_buffer));
+    try std.testing.expectEqualStrings("65534", qclassDisplay(65534, &qclass_buffer));
+}
+
+test "parse DNS question rejects truncated packet" {
+    const packet = [_]u8{
+        0x00, 0x01, 0x01, 0x00,
+        0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00,
+    };
+    var domain_buffer: [256]u8 = undefined;
+
+    try std.testing.expectError(error.PacketTooShort, parseDnsQuestion(&domain_buffer, &packet));
 }
 
 test "extract compressed domain name" {

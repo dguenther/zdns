@@ -198,16 +198,23 @@ const ForwardingServer = struct {
         std.log.debug("recv - local - id: {d} - {d} bytes from {}\n", .{ request_id, n, sender });
 
         var domain_buffer: [256]u8 = undefined;
-        const domain_name = util.extractDomainName(&domain_buffer, data) catch |err| {
-            std.log.warn("Failed to extract domain name: {}\n", .{err});
+        const question = util.parseDnsQuestion(&domain_buffer, data) catch |err| {
+            std.log.warn("Failed to parse DNS question: {}\n", .{err});
             return .rearm;
         };
 
-        std.log.info("DNS query for domain: {s}", .{domain_name});
+        if (comptime std.log.defaultLogEnabled(.info)) {
+            var qtype_buffer: [5]u8 = undefined;
+            var qclass_buffer: [5]u8 = undefined;
+            const qtype_display = util.qtypeDisplay(question.qtype, &qtype_buffer);
+            const qclass_display = util.qclassDisplay(question.qclass, &qclass_buffer);
+
+            std.log.info("DNS query: qname={s} qtype={s} qclass={s}", .{ question.qname, qtype_display, qclass_display });
+        }
 
         // Check if domain is blocked
-        if (self.?.blocked_domains.contains(domain_name)) {
-            std.log.info("Blocking domain: {s}", .{domain_name});
+        if (self.?.blocked_domains.contains(question.qname)) {
+            std.log.info("Blocking domain: {s}", .{question.qname});
 
             // Create a response packet based on the request
             var response_buffer: [512]u8 = undefined;
@@ -232,31 +239,8 @@ const ForwardingServer = struct {
                     response_buffer[6] = 0;
                     response_buffer[7] = 1;
 
-                    // Keep original query data
-                    var pos: usize = 12;
-
-                    // Skip the question section (domain name + QTYPE + QCLASS)
-                    while (pos < n) {
-                        if (pos + 1 >= n) break; // Ensure we don't go out of bounds
-
-                        // Check for compression pointer (top 2 bits are 1s)
-                        if ((response_buffer[pos] & 0xC0) == 0xC0) {
-                            pos += 2; // Skip the 2-byte compression pointer
-                            break;
-                        }
-
-                        // Skip over the label
-                        const label_len = response_buffer[pos];
-                        if (label_len == 0) {
-                            pos += 1; // Skip the null byte
-                            break;
-                        }
-
-                        pos += label_len + 1; // Skip the length byte and the label
-                    }
-
-                    // Skip QTYPE and QCLASS (4 bytes)
-                    pos += 4;
+                    // Append the answer after the parsed question section.
+                    var pos = question.question_end;
 
                     // Add answer section
                     // Answer name is a pointer to the question
