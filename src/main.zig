@@ -104,6 +104,78 @@ const RequestSender = struct {
     id: u16,
 };
 
+const PacketWriter = struct {
+    buffer: []u8,
+    pos: usize,
+
+    fn writeByte(self: *PacketWriter, value: u8) !void {
+        if (self.pos + 1 > self.buffer.len) return error.BufferTooSmall;
+        self.buffer[self.pos] = value;
+        self.pos += 1;
+    }
+
+    fn writeU16(self: *PacketWriter, value: u16) !void {
+        if (self.pos + 2 > self.buffer.len) return error.BufferTooSmall;
+        std.mem.writeInt(u16, self.buffer[self.pos..][0..2], value, .big);
+        self.pos += 2;
+    }
+
+    fn writeU32(self: *PacketWriter, value: u32) !void {
+        if (self.pos + 4 > self.buffer.len) return error.BufferTooSmall;
+        std.mem.writeInt(u32, self.buffer[self.pos..][0..4], value, .big);
+        self.pos += 4;
+    }
+
+    fn writeZeroes(self: *PacketWriter, len: usize) !void {
+        if (self.pos + len > self.buffer.len) return error.BufferTooSmall;
+        @memset(self.buffer[self.pos .. self.pos + len], 0);
+        self.pos += len;
+    }
+};
+
+fn buildBlockedResponse(buffer: []u8, request: []const u8, question: util.DnsQuestion, block_mode: BlockMode) ![]u8 {
+    if (question.question_end > request.len or question.question_end > buffer.len) return error.PacketTooShort;
+
+    @memcpy(buffer[0..question.question_end], request[0..question.question_end]);
+
+    buffer[2] = buffer[2] | 0x80; // QR
+    buffer[3] = buffer[3] & 0xF0; // RCODE
+    std.mem.writeInt(u16, buffer[6..][0..2], 0, .big); // ANCOUNT
+    std.mem.writeInt(u16, buffer[8..][0..2], 0, .big); // NSCOUNT
+    std.mem.writeInt(u16, buffer[10..][0..2], 0, .big); // ARCOUNT
+
+    switch (block_mode) {
+        .nxdomain => {
+            buffer[3] = buffer[3] | 0x03; // NXDOMAIN
+            return buffer[0..question.question_end];
+        },
+        .nullip => {
+            const pos = question.question_end;
+            const rdata_len: usize = switch (question.qtype) {
+                1 => 4, // A
+                28 => 16, // AAAA
+                else => 0,
+            };
+
+            if (question.qclass != 1 or rdata_len == 0) {
+                return buffer[0..pos];
+            }
+
+            std.mem.writeInt(u16, buffer[6..][0..2], 1, .big); // ANCOUNT
+
+            var writer = PacketWriter{ .buffer = buffer, .pos = pos };
+            try writer.writeU16(0xC00C); // Pointer to offset 12 (start of question)
+            try writer.writeU16(question.qtype);
+            try writer.writeU16(question.qclass);
+            try writer.writeU32(60);
+            try writer.writeU16(@intCast(rdata_len));
+            try writer.writeZeroes(rdata_len);
+
+            return buffer[0..writer.pos];
+        },
+    }
+}
+
 const ForwardingServer = struct {
     upstream_server: UpstreamServer,
     local_server: LocalServer,
@@ -157,7 +229,7 @@ const ForwardingServer = struct {
         const data = rbuf.slice[0..n];
 
         // parse the request ID from the response
-        const request_id: u16 = @as(u16, data[0]) << 8 | data[1];
+        const request_id = std.mem.readInt(u16, data[0..2], .big);
 
         std.log.debug("recv - upstm - id: {d} - {d} bytes ({})\n", .{ request_id, n, sender });
 
@@ -193,7 +265,7 @@ const ForwardingServer = struct {
         const data = rbuf.slice[0..n];
 
         // parse the request ID from the response
-        const request_id: u16 = @as(u16, data[0]) << 8 | data[1];
+        const request_id = std.mem.readInt(u16, data[0..2], .big);
 
         std.log.debug("recv - local - id: {d} - {d} bytes from {}\n", .{ request_id, n, sender });
 
@@ -216,81 +288,13 @@ const ForwardingServer = struct {
         if (self.?.blocked_domains.contains(question.qname)) {
             std.log.info("Blocking domain: {s}", .{question.qname});
 
-            // Create a response packet based on the request
             var response_buffer: [512]u8 = undefined;
-            @memcpy(response_buffer[0..n], data);
+            const response = buildBlockedResponse(&response_buffer, data, question, self.?.block_mode) catch |err| {
+                std.log.warn("Failed to build blocked response: {}\n", .{err});
+                return .rearm;
+            };
 
-            // Set QR bit to indicate this is a response
-            response_buffer[2] = response_buffer[2] | 0x80; // Set QR bit
-
-            switch (self.?.block_mode) {
-                .nxdomain => {
-                    // Set response flags for NXDOMAIN (domain doesn't exist)
-                    response_buffer[3] = response_buffer[3] & 0xF0; // Clear RCODE
-                    response_buffer[3] = response_buffer[3] | 0x03; // Set RCODE=3 (NXDOMAIN)
-                },
-
-                .nullip => {
-                    // Send 0.0.0.0 as the response
-                    // Standard response
-                    response_buffer[3] = response_buffer[3] & 0xF0; // Clear RCODE
-
-                    // Set answer count to 1
-                    response_buffer[6] = 0;
-                    response_buffer[7] = 1;
-
-                    // Append the answer after the parsed question section.
-                    var pos = question.question_end;
-
-                    // Add answer section
-                    // Answer name is a pointer to the question
-                    response_buffer[pos] = 0xC0;
-                    response_buffer[pos + 1] = 0x0C; // Pointer to offset 12 (start of question)
-                    pos += 2;
-
-                    // Type: A record (0x0001)
-                    response_buffer[pos] = 0x00;
-                    response_buffer[pos + 1] = 0x01;
-                    pos += 2;
-
-                    // Class: IN (0x0001)
-                    response_buffer[pos] = 0x00;
-                    response_buffer[pos + 1] = 0x01;
-                    pos += 2;
-
-                    // TTL: 60 seconds (0x0000003C)
-                    response_buffer[pos] = 0x00;
-                    response_buffer[pos + 1] = 0x00;
-                    response_buffer[pos + 2] = 0x00;
-                    response_buffer[pos + 3] = 0x3C;
-                    pos += 4;
-
-                    // Data length: 4 bytes for IPv4
-                    response_buffer[pos] = 0x00;
-                    response_buffer[pos + 1] = 0x04;
-                    pos += 2;
-
-                    // IP: 0.0.0.0
-                    response_buffer[pos] = 0x00;
-                    response_buffer[pos + 1] = 0x00;
-                    response_buffer[pos + 2] = 0x00;
-                    response_buffer[pos + 3] = 0x00;
-                    pos += 4;
-
-                    // Update packet length - cast to ensure proper type
-                    const response_size: usize = pos;
-
-                    // Send the response back to the client
-                    self.?.local_server.sendTo(loop, sender, response_buffer[0..response_size]) catch |err| {
-                        std.log.warn("Failed to send blocked response: {}\n", .{err});
-                    };
-
-                    return .rearm;
-                },
-            }
-
-            // Send the response back to the client for NXDOMAIN case
-            self.?.local_server.sendTo(loop, sender, response_buffer[0..n]) catch |err| {
+            self.?.local_server.sendTo(loop, sender, response) catch |err| {
                 std.log.warn("Failed to send blocked response: {}\n", .{err});
             };
 
@@ -434,6 +438,96 @@ const LocalServer = struct {
         return .disarm;
     }
 };
+
+test "blocked nullip response returns A 0.0.0.0 for A queries" {
+    const hex_string = "cfc9010000010000000000000a6475636b6475636b676f03636f6d0000010001";
+    var request: [hex_string.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&request, hex_string);
+
+    var domain_buffer: [256]u8 = undefined;
+    const question = try util.parseDnsQuestion(&domain_buffer, &request);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try buildBlockedResponse(&response_buffer, &request, question, .nullip);
+
+    try std.testing.expectEqual(@as(usize, question.question_end + 16), response.len);
+    try std.testing.expect(response[2] & 0x80 != 0);
+    try std.testing.expectEqual(@as(u8, 0), response[3] & 0x0F);
+    try std.testing.expectEqual(@as(u8, 0), response[6]);
+    try std.testing.expectEqual(@as(u8, 1), response[7]);
+
+    const answer = [_]u8{
+        0xC0, 0x0C, // name pointer
+        0x00, 0x01, // A
+        0x00, 0x01, // IN
+        0x00, 0x00, 0x00, 0x3C, // TTL
+        0x00, 0x04, // RDLENGTH
+        0x00, 0x00, 0x00, 0x00, // 0.0.0.0
+    };
+    try std.testing.expectEqualSlices(u8, &answer, response[question.question_end..]);
+}
+
+test "blocked nullip response returns AAAA :: for AAAA queries" {
+    const hex_string = "000101000001000000000000076578616d706c6503636f6d00001c0001";
+    var request: [hex_string.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&request, hex_string);
+
+    var domain_buffer: [256]u8 = undefined;
+    const question = try util.parseDnsQuestion(&domain_buffer, &request);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try buildBlockedResponse(&response_buffer, &request, question, .nullip);
+
+    try std.testing.expectEqual(@as(usize, question.question_end + 28), response.len);
+    try std.testing.expectEqual(@as(u8, 0), response[6]);
+    try std.testing.expectEqual(@as(u8, 1), response[7]);
+
+    const answer_prefix = [_]u8{
+        0xC0, 0x0C, // name pointer
+        0x00, 0x1C, // AAAA
+        0x00, 0x01, // IN
+        0x00, 0x00, 0x00, 0x3C, // TTL
+        0x00, 0x10, // RDLENGTH
+    };
+    try std.testing.expectEqualSlices(u8, &answer_prefix, response[question.question_end .. question.question_end + answer_prefix.len]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), response[question.question_end + answer_prefix.len ..]);
+}
+
+test "blocked nullip response returns NODATA for other query types" {
+    const hex_string = "000101000001000000000000076578616d706c6503636f6d0000410001";
+    var request: [hex_string.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&request, hex_string);
+
+    var domain_buffer: [256]u8 = undefined;
+    const question = try util.parseDnsQuestion(&domain_buffer, &request);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try buildBlockedResponse(&response_buffer, &request, question, .nullip);
+
+    try std.testing.expectEqual(@as(usize, question.question_end), response.len);
+    try std.testing.expect(response[2] & 0x80 != 0);
+    try std.testing.expectEqual(@as(u8, 0), response[3] & 0x0F);
+    try std.testing.expectEqual(@as(u8, 0), response[6]);
+    try std.testing.expectEqual(@as(u8, 0), response[7]);
+}
+
+test "blocked nxdomain response returns NXDOMAIN without answers" {
+    const hex_string = "cfc9010000010000000000000a6475636b6475636b676f03636f6d0000010001";
+    var request: [hex_string.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&request, hex_string);
+
+    var domain_buffer: [256]u8 = undefined;
+    const question = try util.parseDnsQuestion(&domain_buffer, &request);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try buildBlockedResponse(&response_buffer, &request, question, .nxdomain);
+
+    try std.testing.expectEqual(@as(usize, question.question_end), response.len);
+    try std.testing.expect(response[2] & 0x80 != 0);
+    try std.testing.expectEqual(@as(u8, 3), response[3] & 0x0F);
+    try std.testing.expectEqual(@as(u8, 0), response[6]);
+    try std.testing.expectEqual(@as(u8, 0), response[7]);
+}
 
 test {
     std.testing.refAllDecls(@This());
