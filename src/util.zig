@@ -1,12 +1,12 @@
 const std = @import("std");
 
 pub const DnsName = struct {
-    name: []u8,
+    canonical_name: []u8,
     end_pos: usize,
 };
 
 pub const DnsQuestion = struct {
-    qname: []u8,
+    canonical_qname: []u8,
     qtype: u16,
     qclass: u16,
     question_end: usize,
@@ -14,13 +14,16 @@ pub const DnsQuestion = struct {
 
 /// Extracts the domain name from a DNS request packet
 /// The returned domain name is a slice of a static buffer with the domain
-/// name in human-readable format (e.g., "example.com")
+/// name in canonical lowercase, human-readable format (e.g., "example.com").
+/// The input packet is not modified, preserving DNS 0x20 query casing.
 /// TODO: This is probably missing many edge cases. E.g. reject multiple questions
 pub fn extractDomainName(buffer: []u8, packet: []const u8) ![]u8 {
     const name = try parseDnsName(buffer, packet, 12);
-    return name.name;
+    return name.canonical_name;
 }
 
+/// Parses the first DNS question. The returned qname is a dotted presentation
+/// name canonicalized to ASCII lowercase in `buffer`; `packet` is not modified.
 pub fn parseDnsQuestion(buffer: []u8, packet: []const u8) !DnsQuestion {
     // DNS header is 12 bytes, the query starts after that
     if (packet.len < 13) return error.PacketTooShort;
@@ -33,7 +36,7 @@ pub fn parseDnsQuestion(buffer: []u8, packet: []const u8) !DnsQuestion {
     const qclass = std.mem.readInt(u16, packet[qtype_pos + 2 ..][0..2], .big);
 
     return .{
-        .qname = qname.name,
+        .canonical_qname = qname.canonical_name,
         .qtype = qtype,
         .qclass = qclass,
         .question_end = qtype_pos + 4,
@@ -127,11 +130,11 @@ fn parseDnsName(buffer: []u8, packet: []const u8, start_pos: usize) !DnsName {
         }
         first_label = false;
 
-        // Copy the label contents
+        // Copy the label contents into canonical lowercase presentation form.
         if (pos + label_len > packet.len) return error.PacketTooShort;
         if (buf_pos + label_len > buffer.len) return error.BufferTooSmall;
 
-        @memcpy(buffer[buf_pos .. buf_pos + label_len], packet[pos .. pos + label_len]);
+        _ = std.ascii.lowerString(buffer[buf_pos .. buf_pos + label_len], packet[pos .. pos + label_len]);
         pos += label_len;
         buf_pos += label_len;
 
@@ -140,7 +143,7 @@ fn parseDnsName(buffer: []u8, packet: []const u8, start_pos: usize) !DnsName {
     }
 
     return .{
-        .name = buffer[0..buf_pos],
+        .canonical_name = buffer[0..buf_pos],
         .end_pos = end_pos orelse return error.PacketTooShort,
     };
 }
@@ -193,18 +196,26 @@ pub fn parseHostsFile(reader: *const std.io.AnyReader, blocked_domains: *std.Str
 
         const domain_raw = iter.next() orelse continue;
 
-        // Skip localhost entries and other special cases
-        if (std.mem.eql(u8, domain_raw, "localhost") or
-            std.mem.eql(u8, domain_raw, "localhost.localdomain") or
-            std.mem.eql(u8, domain_raw, "broadcasthost") or
-            std.mem.startsWith(u8, domain_raw, "ip6-"))
+        // Filter and deduplicate against a stack canonical copy; only new
+        // domains need heap-owned keys in the map.
+        var domain_buffer: [253]u8 = undefined;
+        if (domain_raw.len > domain_buffer.len) continue;
+        const domain = std.ascii.lowerString(&domain_buffer, domain_raw);
+
+        // Skip localhost entries and other special cases.
+        if (std.mem.eql(u8, domain, "localhost") or
+            std.mem.eql(u8, domain, "localhost.localdomain") or
+            std.mem.eql(u8, domain, "broadcasthost") or
+            std.mem.startsWith(u8, domain, "ip6-"))
         {
             continue;
         }
 
-        // Store a copy of the domain in the hashmap
-        const domain = try allocator.dupe(u8, domain_raw);
-        try blocked_domains.put(domain, domain);
+        if (blocked_domains.contains(domain)) continue;
+
+        const owned_domain = try allocator.dupe(u8, domain);
+        errdefer allocator.free(owned_domain);
+        try blocked_domains.put(owned_domain, owned_domain);
     }
 
     std.log.info("Loaded {} blocked domains", .{blocked_domains.count()});
@@ -228,12 +239,25 @@ test "parse DNS question for A record" {
     var domain_buffer: [256]u8 = undefined;
     const question = try parseDnsQuestion(&domain_buffer, &bytes);
 
-    try std.testing.expectEqualStrings("duckduckgo.com", question.qname);
+    try std.testing.expectEqualStrings("duckduckgo.com", question.canonical_qname);
     try std.testing.expectEqual(@as(u16, 1), question.qtype);
     try std.testing.expectEqual(@as(u16, 1), question.qclass);
     try std.testing.expectEqual(@as(usize, 32), question.question_end);
     try std.testing.expectEqualStrings("A", qtypeName(question.qtype).?);
     try std.testing.expectEqualStrings("IN", qclassName(question.qclass).?);
+}
+
+test "parse DNS question canonicalizes qname without changing packet" {
+    const hex_string = "cfc9010000010000000000000a4475636b4475636b476f03434f4d0000010001";
+    var bytes: [hex_string.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, hex_string);
+    const original_bytes = bytes;
+
+    var domain_buffer: [256]u8 = undefined;
+    const question = try parseDnsQuestion(&domain_buffer, &bytes);
+
+    try std.testing.expectEqualStrings("duckduckgo.com", question.canonical_qname);
+    try std.testing.expectEqualSlices(u8, &original_bytes, &bytes);
 }
 
 test "parse DNS question for AAAA record" {
@@ -244,7 +268,7 @@ test "parse DNS question for AAAA record" {
     var domain_buffer: [256]u8 = undefined;
     const question = try parseDnsQuestion(&domain_buffer, &bytes);
 
-    try std.testing.expectEqualStrings("example.com", question.qname);
+    try std.testing.expectEqualStrings("example.com", question.canonical_qname);
     try std.testing.expectEqual(@as(u16, 28), question.qtype);
     try std.testing.expectEqual(@as(u16, 1), question.qclass);
     try std.testing.expectEqual(@as(usize, 29), question.question_end);
@@ -259,7 +283,7 @@ test "unknown DNS question type falls back to numeric display" {
     var domain_buffer: [256]u8 = undefined;
     const question = try parseDnsQuestion(&domain_buffer, &bytes);
 
-    try std.testing.expectEqualStrings("example.com", question.qname);
+    try std.testing.expectEqualStrings("example.com", question.canonical_qname);
     try std.testing.expectEqual(@as(u16, 65534), question.qtype);
     try std.testing.expect(qtypeName(question.qtype) == null);
     try std.testing.expectEqualStrings("IN", qclassName(question.qclass).?);
@@ -308,9 +332,14 @@ test "parse hosts file" {
         \\127.0.0.1 localhost
         \\0.0.0.0 localhost.localdomain # should be ignored
         \\0.0.0.0 ip6-localhost # should be ignored
+        \\0.0.0.0 LocalHost # should be ignored
+        \\0.0.0.0 BROADCASTHOST # should be ignored
+        \\0.0.0.0 IP6-localhost # should be ignored
         \\1.2.3.4 allowed.example.com # different IP should be ignored
         \\
-        \\0.0.0.0 another-ad.example.com
+        \\0.0.0.0 Another-Ad.Example.COM
+        \\0.0.0.0 ads.example.com
+        \\0.0.0.0 ANOTHER-AD.EXAMPLE.com
     ;
 
     var blocked_domains = std.StringHashMap([]const u8).init(std.testing.allocator);
@@ -334,11 +363,16 @@ test "parse hosts file" {
     try std.testing.expect(blocked_domains.contains("ads.example.com"));
     try std.testing.expect(blocked_domains.contains("tracking.example.com"));
     try std.testing.expect(blocked_domains.contains("another-ad.example.com"));
+    try std.testing.expect(!blocked_domains.contains("Another-Ad.Example.COM"));
 
     // Check domains we should have skipped
     try std.testing.expect(!blocked_domains.contains("localhost"));
     try std.testing.expect(!blocked_domains.contains("localhost.localdomain"));
+    try std.testing.expect(!blocked_domains.contains("broadcasthost"));
     try std.testing.expect(!blocked_domains.contains("ip6-localhost"));
+    try std.testing.expect(!blocked_domains.contains("LocalHost"));
+    try std.testing.expect(!blocked_domains.contains("BROADCASTHOST"));
+    try std.testing.expect(!blocked_domains.contains("IP6-localhost"));
     try std.testing.expect(!blocked_domains.contains("allowed.example.com"));
 }
 
